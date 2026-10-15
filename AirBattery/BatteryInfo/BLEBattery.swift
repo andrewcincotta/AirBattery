@@ -94,7 +94,17 @@ class BLEBattery: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
     @AppStorage("twsMerge") var twsMerge = 5
     
     var centralManager: CBCentralManager!
-    var peripherals: [CBPeripheral?] = []
+    // Peripherals with an in-flight connection attempt, keyed by identifier.
+    // This also holds the strong reference CoreBluetooth requires while connecting.
+    var connecting: [UUID: CBPeripheral] = [:]
+    // Outstanding GATT operations (service/characteristic discovery and reads) per connection attempt.
+    // The connection is closed as soon as this drops to zero.
+    var pendingOps: [UUID: Int] = [:]
+    // Bumped on every attempt so a stale timeout can't cancel a newer attempt.
+    var attemptNumber: [UUID: Int] = [:]
+    var gotBattery: Set<UUID> = []
+    // Unknown peripherals that gave no battery reading (e.g. other people's devices) and when they may be retried.
+    var retryAfter: [UUID: Double] = [:]
     var otherAppleDevices: [String] = []
     var bleDevicesLevel: [String:UInt8] = [:]
     var bleDevicesVendor: [String:String] = [:]
@@ -139,9 +149,63 @@ class BLEBattery: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         centralManager.stopScan()
     }
     
+    // Starts at most one connection attempt per peripheral and always ends it (on completion or timeout).
+    // macOS never times out pending connections on its own, so without this, connections to devices that
+    // can't be read (or have walked away) pile up in crowded places and starve new ones, e.g. your iPhone.
+    func connectForBattery(_ peripheral: CBPeripheral) {
+        let id = peripheral.identifier
+        if connecting[id] != nil { return }
+        if let until = retryAfter[id], Date().timeIntervalSince1970 < until { return }
+        let attempt = (attemptNumber[id] ?? 0) + 1
+        attemptNumber[id] = attempt
+        connecting[id] = peripheral
+        pendingOps[id] = 0
+        gotBattery.remove(id)
+        centralManager.connect(peripheral, options: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let self = self, self.connecting[id] != nil, self.attemptNumber[id] == attempt else { return }
+            self.finishConnection(peripheral)
+        }
+    }
+
+    func finishConnection(_ peripheral: CBPeripheral) {
+        let id = peripheral.identifier
+        guard connecting[id] != nil else { return }
+        // Back off unknown peripherals that connected but gave no battery level (other people's devices, lights,
+        // etc.) so they aren't reconnected every scan. Plain timeouts aren't penalised; the device may just be far away.
+        if peripheral.state == .connected && !gotBattery.contains(id) && AirBatteryModel.getByName(peripheral.name ?? "") == nil {
+            retryAfter[id] = Date().timeIntervalSince1970 + 1800
+        }
+        connecting[id] = nil
+        pendingOps[id] = nil
+        gotBattery.remove(id)
+        centralManager.cancelPeripheralConnection(peripheral)
+    }
+
+    // Adjusts the outstanding operation count and closes the connection once nothing is left to wait for.
+    func trackOps(_ peripheral: CBPeripheral, _ delta: Int) {
+        let id = peripheral.identifier
+        guard let ops = pendingOps[id] else { return }
+        pendingOps[id] = ops + delta
+        if ops + delta <= 0 { finishConnection(peripheral) }
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        finishConnection(peripheral)
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        finishConnection(peripheral)
+    }
+
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard connecting[peripheral.identifier] != nil else {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
         peripheral.delegate = self
-        peripheral.discoverServices(nil)
+        trackOps(peripheral, 1)
+        peripheral.discoverServices([CBUUID(string: "180F"), CBUUID(string: "180A")])
     }
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
@@ -170,10 +234,7 @@ class BLEBattery: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
                 }
             }
         }
-        if get {
-            self.peripherals.append(peripheral)
-            self.centralManager.connect(peripheral, options: nil)
-        }
+        if get { connectForBattery(peripheral) }
     }
     
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
@@ -181,8 +242,10 @@ class BLEBattery: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         //let blockedItems = (ud.object(forKey: "blockedDevices") as? [String]) ?? [String]()
         //if blockedItems.contains(name) && !whitelistMode { return }
         //if !blockedItems.contains(name) && whitelistMode { return }
-        guard let services = peripheral.services else { return }
+        defer { trackOps(peripheral, -1) }
+        guard error == nil, let services = peripheral.services else { return }
         for service in services {
+            trackOps(peripheral, 1)
             peripheral.discoverCharacteristics(nil, for: service)
         }
     }
@@ -192,18 +255,16 @@ class BLEBattery: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         //let blockedItems = (ud.object(forKey: "blockedDevices") as? [String]) ?? [String]()
         //if blockedItems.contains(name) && !whitelistMode { return }
         //if !blockedItems.contains(name) && whitelistMode { return }
-        guard let characteristics = service.characteristics else { return }
-        var clear = true
+        defer { trackOps(peripheral, -1) }
+        guard error == nil, let characteristics = service.characteristics else { return }
         if service.uuid == CBUUID(string: "180F") || service.uuid == CBUUID(string: "180A") {
             for characteristic in characteristics {
                 if characteristic.uuid == CBUUID(string: "2A19") || characteristic.uuid == CBUUID(string: "2A24") || characteristic.uuid == CBUUID(string: "2A29") {
-                    clear = false
+                    trackOps(peripheral, 1)
                     peripheral.readValue(for: characteristic)
                 }
             }
         }
-        if clear { if let index = self.peripherals.firstIndex(of: peripheral) { self.peripherals.remove(at: index) } }
-        
     }
     
     //电量信息
@@ -213,11 +274,15 @@ class BLEBattery: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate {
         //if blockedItems.contains(name) && !whitelistMode { return }
         //if !blockedItems.contains(name) && whitelistMode { return }
         
+        defer { trackOps(peripheral, -1) }
+        // Other people's devices reject the read with "Encryption is insufficient"
+        guard error == nil else { return }
         if characteristic.uuid == CBUUID(string: "2A19"){
-            if let data = characteristic.value, let deviceName = peripheral.name {
+            if let data = characteristic.value, !data.isEmpty, let deviceName = peripheral.name {
                 let now = Date().timeIntervalSince1970
                 let level = Int(data[0])
                 if level > 100 { return }
+                gotBattery.insert(peripheral.identifier)
                 var charging = 0
                 //if let lastLevel = bleDevicesLevel[deviceName], cStatusOfBLE {
                 if let lastLevel = bleDevicesLevel[deviceName] {
